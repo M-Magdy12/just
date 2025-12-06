@@ -1,0 +1,4008 @@
+FROM python:3.9-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application
+COPY app.py .
+
+# Create volume for database
+VOLUME ["/app"]
+
+# Expose ports
+EXPOSE 5000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:5000/health || exit 1
+
+# Run application
+CMD ["python", "app.py"]
+from flask import Flask, jsonify, request, send_from_directory
+from prometheus_flask_exporter import PrometheusMetrics
+from prometheus_client import Counter
+import sqlite3
+import logging
+from datetime import datetime
+import os
+
+app = Flask(__name__, static_folder='.')
+
+# Prometheus metrics
+metrics = PrometheusMetrics(app, defaults_prefix="ecommerce_app")
+metrics.info('app_info', 'E-commerce Application', version='1.0.0')
+
+# Custom metrics
+order_counter = Counter(
+    'ecommerce_app_orders_total', 
+    'Total number of successfully created orders'
+)
+
+order_revenue = Counter(
+    'ecommerce_app_revenue_total',
+    'Total revenue from orders'
+)
+
+product_requests = Counter(
+    'ecommerce_app_product_requests_total',
+    'Total product requests',
+    ['endpoint', 'method']
+)
+
+low_stock_products = Counter(
+    'ecommerce_app_low_stock_total',
+    'Products with low stock (< 10 items)'
+)
+
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Safe DB connection
+def get_db():
+    conn = sqlite3.connect('ecommerce.db', check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# DB Initialization
+def init_db():
+    conn = sqlite3.connect('ecommerce.db')
+    c = conn.cursor()
+
+    c.execute('''CREATE TABLE IF NOT EXISTS products
+                (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                price REAL NOT NULL,
+                stock INTEGER NOT NULL)''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS orders
+                (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER,
+                quantity INTEGER,
+                total_price REAL,
+                order_date TEXT,
+                FOREIGN KEY(product_id) REFERENCES products(id))''')
+
+    # Insert sample data
+    c.execute("SELECT COUNT(*) FROM products")
+    if c.fetchone()[0] == 0:
+        sample = [
+            ('Laptop', 15000, 50),
+            ('Phone', 8000, 100),
+            ('Headphones', 500, 200),
+            ('Mouse', 150, 300),
+            ('Keyboard', 800, 150)
+        ]
+        c.executemany("INSERT INTO products (name, price, stock) VALUES (?, ?, ?)", sample)
+
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized successfully")
+
+init_db()
+
+# Serve HTML
+@app.route('/')
+def index():
+    return send_from_directory('.', 'index.html')
+
+# API Routes
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()}), 200
+
+@app.route('/products')
+def get_products():
+    try:
+        product_requests.labels(endpoint='/products', method='GET').inc()
+        
+        conn = get_db()
+        rows = conn.execute("SELECT * FROM products").fetchall()
+        conn.close()
+
+        for row in rows:
+            if row['stock'] < 10:
+                low_stock_products.inc()
+
+        return jsonify([dict(r) for r in rows]), 200
+        
+    except Exception as e:
+        logger.error(f"Error getting products: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/products/<int:pid>')
+def get_product(pid):
+    try:
+        product_requests.labels(endpoint=f'/products/{pid}', method='GET').inc()
+        
+        conn = get_db()
+        item = conn.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+        conn.close()
+
+        if item:
+            return jsonify(dict(item)), 200
+        return jsonify({"error": "Product not found"}), 404
+
+    except Exception as e:
+        logger.error(f"Error getting product: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/orders', methods=['POST'])
+def create_order():
+    try:
+        data = request.get_json()
+        pid = data.get("product_id")
+        qty = data.get("quantity")
+
+        if not pid or not qty:
+            return jsonify({"error": "product_id and quantity required"}), 400
+
+        conn = get_db()
+        product = conn.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+
+        if not product:
+            conn.close()
+            return jsonify({"error": "Product not found"}), 404
+
+        if product["stock"] < qty:
+            conn.close()
+            return jsonify({"error": "Insufficient stock"}), 400
+
+        total = product["price"] * qty
+        date = datetime.now().isoformat()
+
+        cur = conn.cursor()
+        cur.execute("INSERT INTO orders (product_id, quantity, total_price, order_date) VALUES (?, ?, ?, ?)",
+                    (pid, qty, total, date))
+        cur.execute("UPDATE products SET stock = stock - ? WHERE id = ?", (qty, pid))
+
+        order_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+
+        order_counter.inc()
+        order_revenue.inc(total)
+
+        logger.info(f"Order {order_id} created - Revenue: {total}")
+        
+        return jsonify({
+            "order_id": order_id,
+            "product_id": pid,
+            "quantity": qty,
+            "total_price": total,
+            "order_date": date
+        }), 201
+
+    except Exception as e:
+        logger.error(f"Error creating order: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/orders')
+def get_orders():
+    try:
+        conn = get_db()
+        rows = conn.execute("""
+            SELECT o.*, p.name AS product_name
+            FROM orders o JOIN products p ON o.product_id = p.id
+            ORDER BY o.order_date DESC
+        """).fetchall()
+        conn.close()
+
+        return jsonify([dict(r) for r in rows]), 200
+
+    except Exception as e:
+        logger.error(f"Error getting orders: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/stats')
+def stats():
+    try:
+        conn = get_db()
+        products = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        revenue = conn.execute("SELECT SUM(total_price) FROM orders").fetchone()[0] or 0
+        low_stock = conn.execute("SELECT COUNT(*) FROM products WHERE stock < 10").fetchone()[0]
+        conn.close()
+
+        return jsonify({
+            "total_products": products,
+            "total_orders": orders,
+            "total_revenue": revenue,
+            "low_stock_products": low_stock
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ecommerce-alerts
+  labels:
+    app: ecommerce
+    release: prometheus
+spec:
+  groups:
+  - name: ecommerce
+    interval: 30s
+    rules:
+    # Application availability
+    - alert: EcommerceAppDown
+      expr: up{job="ecommerce-service"} == 0
+      for: 1m
+      labels:
+        severity: critical
+        app: ecommerce
+      annotations:
+        summary: "E-commerce application is down"
+        description: "E-commerce app {{ $labels.instance }} has been down for more than 1 minute"
+    
+    # High error rate
+    - alert: HighErrorRate
+      expr: rate(flask_http_request_total{status=~"5.."}[5m]) > 0.05
+      for: 2m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "High error rate detected"
+        description: "Error rate is {{ $value }} errors per second on {{ $labels.instance }}"
+    
+    # High response time
+    - alert: HighResponseTime
+      expr: flask_http_request_duration_seconds_sum / flask_http_request_duration_seconds_count > 1
+      for: 3m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "High response time detected"
+        description: "Average response time is {{ $value }}s on {{ $labels.instance }}"
+    
+    # High memory usage
+    - alert: HighMemoryUsage
+      expr: container_memory_usage_bytes{pod=~"ecommerce-app-.*"} / container_spec_memory_limit_bytes{pod=~"ecommerce-app-.*"} > 0.85
+      for: 5m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "High memory usage"
+        description: "Memory usage is {{ $value | humanizePercentage }} on pod {{ $labels.pod }}"
+    
+    # High CPU usage
+    - alert: HighCPUUsage
+      expr: rate(container_cpu_usage_seconds_total{pod=~"ecommerce-app-.*"}[5m]) > 0.8
+      for: 5m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "High CPU usage"
+        description: "CPU usage is {{ $value | humanizePercentage }} on pod {{ $labels.pod }}"
+    
+    # Pod restart
+    - alert: PodRestarting
+      expr: rate(kube_pod_container_status_restarts_total{pod=~"ecommerce-app-.*"}[15m]) > 0
+      for: 5m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "Pod is restarting frequently"
+        description: "Pod {{ $labels.pod }} has restarted {{ $value }} times in the last 15 minutes"
+    
+    # Low request rate (potential issue)
+    - alert: LowRequestRate
+      expr: rate(flask_http_request_total[5m]) < 0.01
+      for: 10m
+      labels:
+        severity: info
+        app: ecommerce
+      annotations:
+        summary: "Low request rate detected"
+        description: "Request rate is very low: {{ $value }} requests/sec on {{ $labels.instance }}"
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ecommerce-monitor
+  labels:
+    app: ecommerce
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: ecommerce
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 15s
+    scrapeTimeout: 10s
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>متجر إلكتروني - E-commerce Store</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        header {
+            background: white;
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin-bottom: 30px;
+            text-align: center;
+        }
+
+        h1 {
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+
+        .stat-card h3 {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 10px;
+        }
+
+        .stat-card .number {
+            font-size: 28px;
+            font-weight: bold;
+            color: #667eea;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .tab {
+            background: white;
+            padding: 12px 25px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+            box-shadow: 0 3px 10px rgba(0,0,0,0.1);
+        }
+
+        .tab:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+
+        .tab.active {
+            background: #667eea;
+            color: white;
+        }
+
+        .content {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+
+        .products-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 20px;
+        }
+
+        .product-card {
+            background: linear-gradient(145deg, #f0f0f0, #ffffff);
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            transition: transform 0.3s;
+        }
+
+        .product-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+        }
+
+        .product-name {
+            font-size: 20px;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 10px;
+        }
+
+        .product-price {
+            font-size: 24px;
+            color: #667eea;
+            margin: 10px 0;
+        }
+
+        .product-stock {
+            color: #666;
+            margin-bottom: 15px;
+        }
+
+        .stock-low {
+            color: #e74c3c;
+            font-weight: bold;
+        }
+
+        .order-form {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+
+        input[type="number"] {
+            flex: 1;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 5px;
+            font-size: 16px;
+        }
+
+        button {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: all 0.3s;
+        }
+
+        button:hover {
+            background: #5568d3;
+            transform: scale(1.05);
+        }
+
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .orders-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .orders-table th,
+        .orders-table td {
+            padding: 12px;
+            text-align: right;
+            border-bottom: 1px solid #ddd;
+        }
+
+        .orders-table th {
+            background: #667eea;
+            color: white;
+            font-weight: bold;
+        }
+
+        .orders-table tr:hover {
+            background: #f5f5f5;
+        }
+
+        .alert {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            animation: slideIn 0.3s;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateY(-20px);
+                opacity: 0;
+            }
+            to {
+                transform: translateY(0);
+                opacity: 1;
+            }
+        }
+
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .alert-error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #667eea;
+            font-size: 18px;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .refresh-btn {
+            background: #28a745;
+            float: left;
+            margin-bottom: 20px;
+        }
+
+        .refresh-btn:hover {
+            background: #218838;
+        }
+
+        @media (max-width: 768px) {
+            .stats {
+                grid-template-columns: 1fr;
+            }
+            
+            .products-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .tabs {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🛒 المتجر الإلكتروني</h1>
+            <p>E-commerce Store with Real-time Monitoring</p>
+        </header>
+
+        <div id="alert-container"></div>
+
+        <div class="stats">
+            <div class="stat-card">
+                <h3>إجمالي المنتجات</h3>
+                <div class="number" id="total-products">0</div>
+            </div>
+            <div class="stat-card">
+                <h3>إجمالي الطلبات</h3>
+                <div class="number" id="total-orders">0</div>
+            </div>
+            <div class="stat-card">
+                <h3>إجمالي الإيرادات</h3>
+                <div class="number" id="total-revenue">0 ج.م</div>
+            </div>
+            <div class="stat-card">
+                <h3>منتجات قليلة المخزون</h3>
+                <div class="number" id="low-stock">0</div>
+            </div>
+        </div>
+
+        <div class="tabs">
+            <div class="tab active" onclick="switchTab('products')">المنتجات</div>
+            <div class="tab" onclick="switchTab('orders')">الطلبات</div>
+        </div>
+
+        <div class="content">
+            <button class="refresh-btn" onclick="loadData()">🔄 تحديث</button>
+            <div style="clear: both;"></div>
+
+            <div id="products-section">
+                <div class="loading">جاري تحميل المنتجات...</div>
+                <div id="products-grid" class="products-grid hidden"></div>
+            </div>
+
+            <div id="orders-section" class="hidden">
+                <div class="loading">جاري تحميل الطلبات...</div>
+                <div id="orders-table" class="hidden"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const API_URL = window.location.origin;
+        let currentTab = 'products';
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            loadData();
+            // Auto-refresh every 30 seconds
+            setInterval(loadStats, 30000);
+        });
+
+        // Switch tabs
+        function switchTab(tab) {
+            currentTab = tab;
+            
+            // Update tab styling
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            event.target.classList.add('active');
+            
+            // Show/hide sections
+            if (tab === 'products') {
+                document.getElementById('products-section').classList.remove('hidden');
+                document.getElementById('orders-section').classList.add('hidden');
+                loadProducts();
+            } else {
+                document.getElementById('products-section').classList.add('hidden');
+                document.getElementById('orders-section').classList.remove('hidden');
+                loadOrders();
+            }
+        }
+
+        // Load all data
+        async function loadData() {
+            await loadStats();
+            if (currentTab === 'products') {
+                await loadProducts();
+            } else {
+                await loadOrders();
+            }
+        }
+
+        // Load statistics
+        async function loadStats() {
+            try {
+                const response = await fetch(`${API_URL}/stats`);
+                const data = await response.json();
+                
+                document.getElementById('total-products').textContent = data.total_products;
+                document.getElementById('total-orders').textContent = data.total_orders;
+                document.getElementById('total-revenue').textContent = data.total_revenue.toFixed(2) + ' ج.م';
+                document.getElementById('low-stock').textContent = data.low_stock_products || 0;
+            } catch (error) {
+                showAlert('خطأ في تحميل الإحصائيات', 'error');
+            }
+        }
+
+        // Load products
+        async function loadProducts() {
+            try {
+                const response = await fetch(`${API_URL}/products`);
+                const products = await response.json();
+                
+                const grid = document.getElementById('products-grid');
+                const loading = document.querySelector('#products-section .loading');
+                
+                loading.classList.add('hidden');
+                grid.classList.remove('hidden');
+                
+                grid.innerHTML = products.map(product => `
+                    <div class="product-card">
+                        <div class="product-name">${product.name}</div>
+                        <div class="product-price">${product.price} ج.م</div>
+                        <div class="product-stock ${product.stock < 10 ? 'stock-low' : ''}">
+                            المخزون: ${product.stock} قطعة
+                        </div>
+                        <div class="order-form">
+                            <input 
+                                type="number" 
+                                id="qty-${product.id}" 
+                                min="1" 
+                                max="${product.stock}" 
+                                value="1"
+                                ${product.stock === 0 ? 'disabled' : ''}
+                            >
+                            <button 
+                                onclick="createOrder(${product.id})"
+                                ${product.stock === 0 ? 'disabled' : ''}
+                            >
+                                ${product.stock === 0 ? 'نفذ المخزون' : 'اطلب الآن'}
+                            </button>
+                        </div>
+                    </div>
+                `).join('');
+                
+            } catch (error) {
+                showAlert('خطأ في تحميل المنتجات', 'error');
+            }
+        }
+
+        // Load orders
+        async function loadOrders() {
+            try {
+                const response = await fetch(`${API_URL}/orders`);
+                const orders = await response.json();
+                
+                const container = document.getElementById('orders-table');
+                const loading = document.querySelector('#orders-section .loading');
+                
+                loading.classList.add('hidden');
+                container.classList.remove('hidden');
+                
+                if (orders.length === 0) {
+                    container.innerHTML = '<p style="text-align: center; padding: 40px; color: #999;">لا توجد طلبات حتى الآن</p>';
+                    return;
+                }
+                
+                container.innerHTML = `
+                    <table class="orders-table">
+                        <thead>
+                            <tr>
+                                <th>رقم الطلب</th>
+                                <th>المنتج</th>
+                                <th>الكمية</th>
+                                <th>الإجمالي</th>
+                                <th>التاريخ</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${orders.map(order => `
+                                <tr>
+                                    <td>#${order.id}</td>
+                                    <td>${order.product_name}</td>
+                                    <td>${order.quantity}</td>
+                                    <td>${order.total_price} ج.م</td>
+                                    <td>${new Date(order.order_date).toLocaleString('ar-EG')}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+                
+            } catch (error) {
+                showAlert('خطأ في تحميل الطلبات', 'error');
+            }
+        }
+
+        // Create order
+        async function createOrder(productId) {
+            const quantity = parseInt(document.getElementById(`qty-${productId}`).value);
+            
+            if (!quantity || quantity < 1) {
+                showAlert('الرجاء إدخال كمية صحيحة', 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`${API_URL}/orders`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        product_id: productId,
+                        quantity: quantity
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    showAlert(`تم إنشاء الطلب بنجاح! رقم الطلب: #${data.order_id}`, 'success');
+                    loadData(); // Refresh all data
+                } else {
+                    showAlert(data.error || 'حدث خطأ في إنشاء الطلب', 'error');
+                }
+                
+            } catch (error) {
+                showAlert('خطأ في الاتصال بالخادم', 'error');
+            }
+        }
+
+        // Show alert
+        function showAlert(message, type) {
+            const container = document.getElementById('alert-container');
+            const alert = document.createElement('div');
+            alert.className = `alert alert-${type}`;
+            alert.textContent = message;
+            
+            container.appendChild(alert);
+            
+            setTimeout(() => {
+                alert.remove();
+            }, 5000);
+        }
+
+        // Health check
+        async function checkHealth() {
+            try {
+                const response = await fetch(`${API_URL}/health`);
+                if (response.ok) {
+                    console.log('✅ Application is healthy');
+                }
+            } catch (error) {
+                console.error('❌ Application health check failed');
+            }
+        }
+
+        // Check health every minute
+        setInterval(checkHealth, 60000);
+        checkHealth();
+    </script>
+</body>
+</html>
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ecommerce-app
+  labels:
+    app: ecommerce
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ecommerce
+  template:
+    metadata:
+      labels:
+        app: ecommerce
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: ecommerce
+        image: marwanhassan22/ecommerce-app:v1
+        ports:
+        - containerPort: 5000
+          name: http
+        env:
+        - name: FLASK_ENV
+          value: "production"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        volumeMounts:
+        - name: app-data
+          mountPath: /app
+      volumes:
+      - name: app-data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ecommerce-service
+  labels:
+    app: ecommerce
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "5000"
+    prometheus.io/path: "/metrics"
+spec:
+  type: NodePort
+  selector:
+    app: ecommerce
+  ports:
+  - port: 5000
+    targetPort: 5000
+    nodePort: 30080
+    protocol: TCP
+    name: http
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ecommerce-html
+  labels:
+    app: ecommerce
+data:
+  index.html: |
+    <!-- Copy the full HTML content from index.html artifact here -->
+    <!-- Or mount it as a volume in the deployment -->
+---
+# Update deployment to include the HTML
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ecommerce-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ecommerce
+  template:
+    metadata:
+      labels:
+        app: ecommerce
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: ecommerce
+        image: marwanhassan22:latest
+        ports:
+        - containerPort: 5000
+        volumeMounts:
+        - name: html-volume
+          mountPath: /app/index.html
+          subPath: index.html
+        - name: app-data
+          mountPath: /app/data
+      volumes:
+      - name: html-volume
+        configMap:
+          name: ecommerce-html
+      - name: app-data
+        emptyDir: {}
+Flask==2.3.0
+prometheus-flask-exporter==0.22.4
+werkzeug==2.3.0
+FROM python:3.9-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application
+COPY app.py .
+
+# Create volume for database
+VOLUME ["/app"]
+
+# Expose ports
+EXPOSE 5000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:5000/health || exit 1
+
+# Run application
+CMD ["python", "app.py"]
+from flask import Flask, jsonify, request, send_from_directory
+from prometheus_flask_exporter import PrometheusMetrics
+from prometheus_client import Counter
+import sqlite3
+import logging
+from datetime import datetime
+import os
+
+app = Flask(__name__, static_folder='.')
+
+# Prometheus metrics
+metrics = PrometheusMetrics(app, defaults_prefix="ecommerce_app")
+metrics.info('app_info', 'E-commerce Application', version='1.0.0')
+
+# Custom metrics
+order_counter = Counter(
+    'ecommerce_app_orders_total', 
+    'Total number of successfully created orders'
+)
+
+order_revenue = Counter(
+    'ecommerce_app_revenue_total',
+    'Total revenue from orders'
+)
+
+product_requests = Counter(
+    'ecommerce_app_product_requests_total',
+    'Total product requests',
+    ['endpoint', 'method']
+)
+
+low_stock_products = Counter(
+    'ecommerce_app_low_stock_total',
+    'Products with low stock (< 10 items)'
+)
+
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Safe DB connection
+def get_db():
+    conn = sqlite3.connect('ecommerce.db', check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# DB Initialization
+def init_db():
+    conn = sqlite3.connect('ecommerce.db')
+    c = conn.cursor()
+
+    c.execute('''CREATE TABLE IF NOT EXISTS products
+                (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                price REAL NOT NULL,
+                stock INTEGER NOT NULL)''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS orders
+                (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER,
+                quantity INTEGER,
+                total_price REAL,
+                order_date TEXT,
+                FOREIGN KEY(product_id) REFERENCES products(id))''')
+
+    # Insert sample data
+    c.execute("SELECT COUNT(*) FROM products")
+    if c.fetchone()[0] == 0:
+        sample = [
+            ('Laptop', 15000, 50),
+            ('Phone', 8000, 100),
+            ('Headphones', 500, 200),
+            ('Mouse', 150, 300),
+            ('Keyboard', 800, 150)
+        ]
+        c.executemany("INSERT INTO products (name, price, stock) VALUES (?, ?, ?)", sample)
+
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized successfully")
+
+init_db()
+
+# Serve HTML
+@app.route('/')
+def index():
+    return send_from_directory('.', 'index.html')
+
+# API Routes
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()}), 200
+
+@app.route('/products')
+def get_products():
+    try:
+        product_requests.labels(endpoint='/products', method='GET').inc()
+        
+        conn = get_db()
+        rows = conn.execute("SELECT * FROM products").fetchall()
+        conn.close()
+
+        for row in rows:
+            if row['stock'] < 10:
+                low_stock_products.inc()
+
+        return jsonify([dict(r) for r in rows]), 200
+        
+    except Exception as e:
+        logger.error(f"Error getting products: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/products/<int:pid>')
+def get_product(pid):
+    try:
+        product_requests.labels(endpoint=f'/products/{pid}', method='GET').inc()
+        
+        conn = get_db()
+        item = conn.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+        conn.close()
+
+        if item:
+            return jsonify(dict(item)), 200
+        return jsonify({"error": "Product not found"}), 404
+
+    except Exception as e:
+        logger.error(f"Error getting product: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/orders', methods=['POST'])
+def create_order():
+    try:
+        data = request.get_json()
+        pid = data.get("product_id")
+        qty = data.get("quantity")
+
+        if not pid or not qty:
+            return jsonify({"error": "product_id and quantity required"}), 400
+
+        conn = get_db()
+        product = conn.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+
+        if not product:
+            conn.close()
+            return jsonify({"error": "Product not found"}), 404
+
+        if product["stock"] < qty:
+            conn.close()
+            return jsonify({"error": "Insufficient stock"}), 400
+
+        total = product["price"] * qty
+        date = datetime.now().isoformat()
+
+        cur = conn.cursor()
+        cur.execute("INSERT INTO orders (product_id, quantity, total_price, order_date) VALUES (?, ?, ?, ?)",
+                    (pid, qty, total, date))
+        cur.execute("UPDATE products SET stock = stock - ? WHERE id = ?", (qty, pid))
+
+        order_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+
+        order_counter.inc()
+        order_revenue.inc(total)
+
+        logger.info(f"Order {order_id} created - Revenue: {total}")
+        
+        return jsonify({
+            "order_id": order_id,
+            "product_id": pid,
+            "quantity": qty,
+            "total_price": total,
+            "order_date": date
+        }), 201
+
+    except Exception as e:
+        logger.error(f"Error creating order: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/orders')
+def get_orders():
+    try:
+        conn = get_db()
+        rows = conn.execute("""
+            SELECT o.*, p.name AS product_name
+            FROM orders o JOIN products p ON o.product_id = p.id
+            ORDER BY o.order_date DESC
+        """).fetchall()
+        conn.close()
+
+        return jsonify([dict(r) for r in rows]), 200
+
+    except Exception as e:
+        logger.error(f"Error getting orders: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/stats')
+def stats():
+    try:
+        conn = get_db()
+        products = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        revenue = conn.execute("SELECT SUM(total_price) FROM orders").fetchone()[0] or 0
+        low_stock = conn.execute("SELECT COUNT(*) FROM products WHERE stock < 10").fetchone()[0]
+        conn.close()
+
+        return jsonify({
+            "total_products": products,
+            "total_orders": orders,
+            "total_revenue": revenue,
+            "low_stock_products": low_stock
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ecommerce-alerts
+  labels:
+    app: ecommerce
+    release: prometheus
+spec:
+  groups:
+  - name: ecommerce
+    interval: 30s
+    rules:
+    # Application availability
+    - alert: EcommerceAppDown
+      expr: up{job="ecommerce-service"} == 0
+      for: 1m
+      labels:
+        severity: critical
+        app: ecommerce
+      annotations:
+        summary: "E-commerce application is down"
+        description: "E-commerce app {{ $labels.instance }} has been down for more than 1 minute"
+    
+    # High error rate
+    - alert: HighErrorRate
+      expr: rate(flask_http_request_total{status=~"5.."}[5m]) > 0.05
+      for: 2m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "High error rate detected"
+        description: "Error rate is {{ $value }} errors per second on {{ $labels.instance }}"
+    
+    # High response time
+    - alert: HighResponseTime
+      expr: flask_http_request_duration_seconds_sum / flask_http_request_duration_seconds_count > 1
+      for: 3m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "High response time detected"
+        description: "Average response time is {{ $value }}s on {{ $labels.instance }}"
+    
+    # High memory usage
+    - alert: HighMemoryUsage
+      expr: container_memory_usage_bytes{pod=~"ecommerce-app-.*"} / container_spec_memory_limit_bytes{pod=~"ecommerce-app-.*"} > 0.85
+      for: 5m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "High memory usage"
+        description: "Memory usage is {{ $value | humanizePercentage }} on pod {{ $labels.pod }}"
+    
+    # High CPU usage
+    - alert: HighCPUUsage
+      expr: rate(container_cpu_usage_seconds_total{pod=~"ecommerce-app-.*"}[5m]) > 0.8
+      for: 5m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "High CPU usage"
+        description: "CPU usage is {{ $value | humanizePercentage }} on pod {{ $labels.pod }}"
+    
+    # Pod restart
+    - alert: PodRestarting
+      expr: rate(kube_pod_container_status_restarts_total{pod=~"ecommerce-app-.*"}[15m]) > 0
+      for: 5m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "Pod is restarting frequently"
+        description: "Pod {{ $labels.pod }} has restarted {{ $value }} times in the last 15 minutes"
+    
+    # Low request rate (potential issue)
+    - alert: LowRequestRate
+      expr: rate(flask_http_request_total[5m]) < 0.01
+      for: 10m
+      labels:
+        severity: info
+        app: ecommerce
+      annotations:
+        summary: "Low request rate detected"
+        description: "Request rate is very low: {{ $value }} requests/sec on {{ $labels.instance }}"
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ecommerce-monitor
+  labels:
+    app: ecommerce
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: ecommerce
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 15s
+    scrapeTimeout: 10s
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>متجر إلكتروني - E-commerce Store</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        header {
+            background: white;
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin-bottom: 30px;
+            text-align: center;
+        }
+
+        h1 {
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+
+        .stat-card h3 {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 10px;
+        }
+
+        .stat-card .number {
+            font-size: 28px;
+            font-weight: bold;
+            color: #667eea;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .tab {
+            background: white;
+            padding: 12px 25px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+            box-shadow: 0 3px 10px rgba(0,0,0,0.1);
+        }
+
+        .tab:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+
+        .tab.active {
+            background: #667eea;
+            color: white;
+        }
+
+        .content {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+
+        .products-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 20px;
+        }
+
+        .product-card {
+            background: linear-gradient(145deg, #f0f0f0, #ffffff);
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            transition: transform 0.3s;
+        }
+
+        .product-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+        }
+
+        .product-name {
+            font-size: 20px;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 10px;
+        }
+
+        .product-price {
+            font-size: 24px;
+            color: #667eea;
+            margin: 10px 0;
+        }
+
+        .product-stock {
+            color: #666;
+            margin-bottom: 15px;
+        }
+
+        .stock-low {
+            color: #e74c3c;
+            font-weight: bold;
+        }
+
+        .order-form {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+
+        input[type="number"] {
+            flex: 1;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 5px;
+            font-size: 16px;
+        }
+
+        button {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: all 0.3s;
+        }
+
+        button:hover {
+            background: #5568d3;
+            transform: scale(1.05);
+        }
+
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .orders-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .orders-table th,
+        .orders-table td {
+            padding: 12px;
+            text-align: right;
+            border-bottom: 1px solid #ddd;
+        }
+
+        .orders-table th {
+            background: #667eea;
+            color: white;
+            font-weight: bold;
+        }
+
+        .orders-table tr:hover {
+            background: #f5f5f5;
+        }
+
+        .alert {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            animation: slideIn 0.3s;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateY(-20px);
+                opacity: 0;
+            }
+            to {
+                transform: translateY(0);
+                opacity: 1;
+            }
+        }
+
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .alert-error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #667eea;
+            font-size: 18px;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .refresh-btn {
+            background: #28a745;
+            float: left;
+            margin-bottom: 20px;
+        }
+
+        .refresh-btn:hover {
+            background: #218838;
+        }
+
+        @media (max-width: 768px) {
+            .stats {
+                grid-template-columns: 1fr;
+            }
+            
+            .products-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .tabs {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🛒 المتجر الإلكتروني</h1>
+            <p>E-commerce Store with Real-time Monitoring</p>
+        </header>
+
+        <div id="alert-container"></div>
+
+        <div class="stats">
+            <div class="stat-card">
+                <h3>إجمالي المنتجات</h3>
+                <div class="number" id="total-products">0</div>
+            </div>
+            <div class="stat-card">
+                <h3>إجمالي الطلبات</h3>
+                <div class="number" id="total-orders">0</div>
+            </div>
+            <div class="stat-card">
+                <h3>إجمالي الإيرادات</h3>
+                <div class="number" id="total-revenue">0 ج.م</div>
+            </div>
+            <div class="stat-card">
+                <h3>منتجات قليلة المخزون</h3>
+                <div class="number" id="low-stock">0</div>
+            </div>
+        </div>
+
+        <div class="tabs">
+            <div class="tab active" onclick="switchTab('products')">المنتجات</div>
+            <div class="tab" onclick="switchTab('orders')">الطلبات</div>
+        </div>
+
+        <div class="content">
+            <button class="refresh-btn" onclick="loadData()">🔄 تحديث</button>
+            <div style="clear: both;"></div>
+
+            <div id="products-section">
+                <div class="loading">جاري تحميل المنتجات...</div>
+                <div id="products-grid" class="products-grid hidden"></div>
+            </div>
+
+            <div id="orders-section" class="hidden">
+                <div class="loading">جاري تحميل الطلبات...</div>
+                <div id="orders-table" class="hidden"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const API_URL = window.location.origin;
+        let currentTab = 'products';
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            loadData();
+            // Auto-refresh every 30 seconds
+            setInterval(loadStats, 30000);
+        });
+
+        // Switch tabs
+        function switchTab(tab) {
+            currentTab = tab;
+            
+            // Update tab styling
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            event.target.classList.add('active');
+            
+            // Show/hide sections
+            if (tab === 'products') {
+                document.getElementById('products-section').classList.remove('hidden');
+                document.getElementById('orders-section').classList.add('hidden');
+                loadProducts();
+            } else {
+                document.getElementById('products-section').classList.add('hidden');
+                document.getElementById('orders-section').classList.remove('hidden');
+                loadOrders();
+            }
+        }
+
+        // Load all data
+        async function loadData() {
+            await loadStats();
+            if (currentTab === 'products') {
+                await loadProducts();
+            } else {
+                await loadOrders();
+            }
+        }
+
+        // Load statistics
+        async function loadStats() {
+            try {
+                const response = await fetch(`${API_URL}/stats`);
+                const data = await response.json();
+                
+                document.getElementById('total-products').textContent = data.total_products;
+                document.getElementById('total-orders').textContent = data.total_orders;
+                document.getElementById('total-revenue').textContent = data.total_revenue.toFixed(2) + ' ج.م';
+                document.getElementById('low-stock').textContent = data.low_stock_products || 0;
+            } catch (error) {
+                showAlert('خطأ في تحميل الإحصائيات', 'error');
+            }
+        }
+
+        // Load products
+        async function loadProducts() {
+            try {
+                const response = await fetch(`${API_URL}/products`);
+                const products = await response.json();
+                
+                const grid = document.getElementById('products-grid');
+                const loading = document.querySelector('#products-section .loading');
+                
+                loading.classList.add('hidden');
+                grid.classList.remove('hidden');
+                
+                grid.innerHTML = products.map(product => `
+                    <div class="product-card">
+                        <div class="product-name">${product.name}</div>
+                        <div class="product-price">${product.price} ج.م</div>
+                        <div class="product-stock ${product.stock < 10 ? 'stock-low' : ''}">
+                            المخزون: ${product.stock} قطعة
+                        </div>
+                        <div class="order-form">
+                            <input 
+                                type="number" 
+                                id="qty-${product.id}" 
+                                min="1" 
+                                max="${product.stock}" 
+                                value="1"
+                                ${product.stock === 0 ? 'disabled' : ''}
+                            >
+                            <button 
+                                onclick="createOrder(${product.id})"
+                                ${product.stock === 0 ? 'disabled' : ''}
+                            >
+                                ${product.stock === 0 ? 'نفذ المخزون' : 'اطلب الآن'}
+                            </button>
+                        </div>
+                    </div>
+                `).join('');
+                
+            } catch (error) {
+                showAlert('خطأ في تحميل المنتجات', 'error');
+            }
+        }
+
+        // Load orders
+        async function loadOrders() {
+            try {
+                const response = await fetch(`${API_URL}/orders`);
+                const orders = await response.json();
+                
+                const container = document.getElementById('orders-table');
+                const loading = document.querySelector('#orders-section .loading');
+                
+                loading.classList.add('hidden');
+                container.classList.remove('hidden');
+                
+                if (orders.length === 0) {
+                    container.innerHTML = '<p style="text-align: center; padding: 40px; color: #999;">لا توجد طلبات حتى الآن</p>';
+                    return;
+                }
+                
+                container.innerHTML = `
+                    <table class="orders-table">
+                        <thead>
+                            <tr>
+                                <th>رقم الطلب</th>
+                                <th>المنتج</th>
+                                <th>الكمية</th>
+                                <th>الإجمالي</th>
+                                <th>التاريخ</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${orders.map(order => `
+                                <tr>
+                                    <td>#${order.id}</td>
+                                    <td>${order.product_name}</td>
+                                    <td>${order.quantity}</td>
+                                    <td>${order.total_price} ج.م</td>
+                                    <td>${new Date(order.order_date).toLocaleString('ar-EG')}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+                
+            } catch (error) {
+                showAlert('خطأ في تحميل الطلبات', 'error');
+            }
+        }
+
+        // Create order
+        async function createOrder(productId) {
+            const quantity = parseInt(document.getElementById(`qty-${productId}`).value);
+            
+            if (!quantity || quantity < 1) {
+                showAlert('الرجاء إدخال كمية صحيحة', 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`${API_URL}/orders`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        product_id: productId,
+                        quantity: quantity
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    showAlert(`تم إنشاء الطلب بنجاح! رقم الطلب: #${data.order_id}`, 'success');
+                    loadData(); // Refresh all data
+                } else {
+                    showAlert(data.error || 'حدث خطأ في إنشاء الطلب', 'error');
+                }
+                
+            } catch (error) {
+                showAlert('خطأ في الاتصال بالخادم', 'error');
+            }
+        }
+
+        // Show alert
+        function showAlert(message, type) {
+            const container = document.getElementById('alert-container');
+            const alert = document.createElement('div');
+            alert.className = `alert alert-${type}`;
+            alert.textContent = message;
+            
+            container.appendChild(alert);
+            
+            setTimeout(() => {
+                alert.remove();
+            }, 5000);
+        }
+
+        // Health check
+        async function checkHealth() {
+            try {
+                const response = await fetch(`${API_URL}/health`);
+                if (response.ok) {
+                    console.log('✅ Application is healthy');
+                }
+            } catch (error) {
+                console.error('❌ Application health check failed');
+            }
+        }
+
+        // Check health every minute
+        setInterval(checkHealth, 60000);
+        checkHealth();
+    </script>
+</body>
+</html>
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ecommerce-app
+  labels:
+    app: ecommerce
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ecommerce
+  template:
+    metadata:
+      labels:
+        app: ecommerce
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: ecommerce
+        image: marwanhassan22/ecommerce-app:v1
+        ports:
+        - containerPort: 5000
+          name: http
+        env:
+        - name: FLASK_ENV
+          value: "production"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        volumeMounts:
+        - name: app-data
+          mountPath: /app
+      volumes:
+      - name: app-data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ecommerce-service
+  labels:
+    app: ecommerce
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "5000"
+    prometheus.io/path: "/metrics"
+spec:
+  type: NodePort
+  selector:
+    app: ecommerce
+  ports:
+  - port: 5000
+    targetPort: 5000
+    nodePort: 30080
+    protocol: TCP
+    name: http
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ecommerce-html
+  labels:
+    app: ecommerce
+data:
+  index.html: |
+    <!-- Copy the full HTML content from index.html artifact here -->
+    <!-- Or mount it as a volume in the deployment -->
+---
+# Update deployment to include the HTML
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ecommerce-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ecommerce
+  template:
+    metadata:
+      labels:
+        app: ecommerce
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: ecommerce
+        image: marwanhassan22:latest
+        ports:
+        - containerPort: 5000
+        volumeMounts:
+        - name: html-volume
+          mountPath: /app/index.html
+          subPath: index.html
+        - name: app-data
+          mountPath: /app/data
+      volumes:
+      - name: html-volume
+        configMap:
+          name: ecommerce-html
+      - name: app-data
+        emptyDir: {}
+Flask==2.3.0
+prometheus-flask-exporter==0.22.4
+werkzeug==2.3.0
+FROM python:3.9-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application
+COPY app.py .
+
+# Create volume for database
+VOLUME ["/app"]
+
+# Expose ports
+EXPOSE 5000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:5000/health || exit 1
+
+# Run application
+CMD ["python", "app.py"]
+from flask import Flask, jsonify, request, send_from_directory
+from prometheus_flask_exporter import PrometheusMetrics
+from prometheus_client import Counter
+import sqlite3
+import logging
+from datetime import datetime
+import os
+
+app = Flask(__name__, static_folder='.')
+
+# Prometheus metrics
+metrics = PrometheusMetrics(app, defaults_prefix="ecommerce_app")
+metrics.info('app_info', 'E-commerce Application', version='1.0.0')
+
+# Custom metrics
+order_counter = Counter(
+    'ecommerce_app_orders_total', 
+    'Total number of successfully created orders'
+)
+
+order_revenue = Counter(
+    'ecommerce_app_revenue_total',
+    'Total revenue from orders'
+)
+
+product_requests = Counter(
+    'ecommerce_app_product_requests_total',
+    'Total product requests',
+    ['endpoint', 'method']
+)
+
+low_stock_products = Counter(
+    'ecommerce_app_low_stock_total',
+    'Products with low stock (< 10 items)'
+)
+
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Safe DB connection
+def get_db():
+    conn = sqlite3.connect('ecommerce.db', check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# DB Initialization
+def init_db():
+    conn = sqlite3.connect('ecommerce.db')
+    c = conn.cursor()
+
+    c.execute('''CREATE TABLE IF NOT EXISTS products
+                (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                price REAL NOT NULL,
+                stock INTEGER NOT NULL)''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS orders
+                (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER,
+                quantity INTEGER,
+                total_price REAL,
+                order_date TEXT,
+                FOREIGN KEY(product_id) REFERENCES products(id))''')
+
+    # Insert sample data
+    c.execute("SELECT COUNT(*) FROM products")
+    if c.fetchone()[0] == 0:
+        sample = [
+            ('Laptop', 15000, 50),
+            ('Phone', 8000, 100),
+            ('Headphones', 500, 200),
+            ('Mouse', 150, 300),
+            ('Keyboard', 800, 150)
+        ]
+        c.executemany("INSERT INTO products (name, price, stock) VALUES (?, ?, ?)", sample)
+
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized successfully")
+
+init_db()
+
+# Serve HTML
+@app.route('/')
+def index():
+    return send_from_directory('.', 'index.html')
+
+# API Routes
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()}), 200
+
+@app.route('/products')
+def get_products():
+    try:
+        product_requests.labels(endpoint='/products', method='GET').inc()
+        
+        conn = get_db()
+        rows = conn.execute("SELECT * FROM products").fetchall()
+        conn.close()
+
+        for row in rows:
+            if row['stock'] < 10:
+                low_stock_products.inc()
+
+        return jsonify([dict(r) for r in rows]), 200
+        
+    except Exception as e:
+        logger.error(f"Error getting products: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/products/<int:pid>')
+def get_product(pid):
+    try:
+        product_requests.labels(endpoint=f'/products/{pid}', method='GET').inc()
+        
+        conn = get_db()
+        item = conn.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+        conn.close()
+
+        if item:
+            return jsonify(dict(item)), 200
+        return jsonify({"error": "Product not found"}), 404
+
+    except Exception as e:
+        logger.error(f"Error getting product: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/orders', methods=['POST'])
+def create_order():
+    try:
+        data = request.get_json()
+        pid = data.get("product_id")
+        qty = data.get("quantity")
+
+        if not pid or not qty:
+            return jsonify({"error": "product_id and quantity required"}), 400
+
+        conn = get_db()
+        product = conn.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+
+        if not product:
+            conn.close()
+            return jsonify({"error": "Product not found"}), 404
+
+        if product["stock"] < qty:
+            conn.close()
+            return jsonify({"error": "Insufficient stock"}), 400
+
+        total = product["price"] * qty
+        date = datetime.now().isoformat()
+
+        cur = conn.cursor()
+        cur.execute("INSERT INTO orders (product_id, quantity, total_price, order_date) VALUES (?, ?, ?, ?)",
+                    (pid, qty, total, date))
+        cur.execute("UPDATE products SET stock = stock - ? WHERE id = ?", (qty, pid))
+
+        order_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+
+        order_counter.inc()
+        order_revenue.inc(total)
+
+        logger.info(f"Order {order_id} created - Revenue: {total}")
+        
+        return jsonify({
+            "order_id": order_id,
+            "product_id": pid,
+            "quantity": qty,
+            "total_price": total,
+            "order_date": date
+        }), 201
+
+    except Exception as e:
+        logger.error(f"Error creating order: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/orders')
+def get_orders():
+    try:
+        conn = get_db()
+        rows = conn.execute("""
+            SELECT o.*, p.name AS product_name
+            FROM orders o JOIN products p ON o.product_id = p.id
+            ORDER BY o.order_date DESC
+        """).fetchall()
+        conn.close()
+
+        return jsonify([dict(r) for r in rows]), 200
+
+    except Exception as e:
+        logger.error(f"Error getting orders: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/stats')
+def stats():
+    try:
+        conn = get_db()
+        products = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        revenue = conn.execute("SELECT SUM(total_price) FROM orders").fetchone()[0] or 0
+        low_stock = conn.execute("SELECT COUNT(*) FROM products WHERE stock < 10").fetchone()[0]
+        conn.close()
+
+        return jsonify({
+            "total_products": products,
+            "total_orders": orders,
+            "total_revenue": revenue,
+            "low_stock_products": low_stock
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ecommerce-alerts
+  labels:
+    app: ecommerce
+    release: prometheus
+spec:
+  groups:
+  - name: ecommerce
+    interval: 30s
+    rules:
+    # Application availability
+    - alert: EcommerceAppDown
+      expr: up{job="ecommerce-service"} == 0
+      for: 1m
+      labels:
+        severity: critical
+        app: ecommerce
+      annotations:
+        summary: "E-commerce application is down"
+        description: "E-commerce app {{ $labels.instance }} has been down for more than 1 minute"
+    
+    # High error rate
+    - alert: HighErrorRate
+      expr: rate(flask_http_request_total{status=~"5.."}[5m]) > 0.05
+      for: 2m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "High error rate detected"
+        description: "Error rate is {{ $value }} errors per second on {{ $labels.instance }}"
+    
+    # High response time
+    - alert: HighResponseTime
+      expr: flask_http_request_duration_seconds_sum / flask_http_request_duration_seconds_count > 1
+      for: 3m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "High response time detected"
+        description: "Average response time is {{ $value }}s on {{ $labels.instance }}"
+    
+    # High memory usage
+    - alert: HighMemoryUsage
+      expr: container_memory_usage_bytes{pod=~"ecommerce-app-.*"} / container_spec_memory_limit_bytes{pod=~"ecommerce-app-.*"} > 0.85
+      for: 5m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "High memory usage"
+        description: "Memory usage is {{ $value | humanizePercentage }} on pod {{ $labels.pod }}"
+    
+    # High CPU usage
+    - alert: HighCPUUsage
+      expr: rate(container_cpu_usage_seconds_total{pod=~"ecommerce-app-.*"}[5m]) > 0.8
+      for: 5m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "High CPU usage"
+        description: "CPU usage is {{ $value | humanizePercentage }} on pod {{ $labels.pod }}"
+    
+    # Pod restart
+    - alert: PodRestarting
+      expr: rate(kube_pod_container_status_restarts_total{pod=~"ecommerce-app-.*"}[15m]) > 0
+      for: 5m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "Pod is restarting frequently"
+        description: "Pod {{ $labels.pod }} has restarted {{ $value }} times in the last 15 minutes"
+    
+    # Low request rate (potential issue)
+    - alert: LowRequestRate
+      expr: rate(flask_http_request_total[5m]) < 0.01
+      for: 10m
+      labels:
+        severity: info
+        app: ecommerce
+      annotations:
+        summary: "Low request rate detected"
+        description: "Request rate is very low: {{ $value }} requests/sec on {{ $labels.instance }}"
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ecommerce-monitor
+  labels:
+    app: ecommerce
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: ecommerce
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 15s
+    scrapeTimeout: 10s
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>متجر إلكتروني - E-commerce Store</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        header {
+            background: white;
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin-bottom: 30px;
+            text-align: center;
+        }
+
+        h1 {
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+
+        .stat-card h3 {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 10px;
+        }
+
+        .stat-card .number {
+            font-size: 28px;
+            font-weight: bold;
+            color: #667eea;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .tab {
+            background: white;
+            padding: 12px 25px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+            box-shadow: 0 3px 10px rgba(0,0,0,0.1);
+        }
+
+        .tab:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+
+        .tab.active {
+            background: #667eea;
+            color: white;
+        }
+
+        .content {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+
+        .products-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 20px;
+        }
+
+        .product-card {
+            background: linear-gradient(145deg, #f0f0f0, #ffffff);
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            transition: transform 0.3s;
+        }
+
+        .product-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+        }
+
+        .product-name {
+            font-size: 20px;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 10px;
+        }
+
+        .product-price {
+            font-size: 24px;
+            color: #667eea;
+            margin: 10px 0;
+        }
+
+        .product-stock {
+            color: #666;
+            margin-bottom: 15px;
+        }
+
+        .stock-low {
+            color: #e74c3c;
+            font-weight: bold;
+        }
+
+        .order-form {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+
+        input[type="number"] {
+            flex: 1;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 5px;
+            font-size: 16px;
+        }
+
+        button {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: all 0.3s;
+        }
+
+        button:hover {
+            background: #5568d3;
+            transform: scale(1.05);
+        }
+
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .orders-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .orders-table th,
+        .orders-table td {
+            padding: 12px;
+            text-align: right;
+            border-bottom: 1px solid #ddd;
+        }
+
+        .orders-table th {
+            background: #667eea;
+            color: white;
+            font-weight: bold;
+        }
+
+        .orders-table tr:hover {
+            background: #f5f5f5;
+        }
+
+        .alert {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            animation: slideIn 0.3s;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateY(-20px);
+                opacity: 0;
+            }
+            to {
+                transform: translateY(0);
+                opacity: 1;
+            }
+        }
+
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .alert-error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #667eea;
+            font-size: 18px;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .refresh-btn {
+            background: #28a745;
+            float: left;
+            margin-bottom: 20px;
+        }
+
+        .refresh-btn:hover {
+            background: #218838;
+        }
+
+        @media (max-width: 768px) {
+            .stats {
+                grid-template-columns: 1fr;
+            }
+            
+            .products-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .tabs {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🛒 المتجر الإلكتروني</h1>
+            <p>E-commerce Store with Real-time Monitoring</p>
+        </header>
+
+        <div id="alert-container"></div>
+
+        <div class="stats">
+            <div class="stat-card">
+                <h3>إجمالي المنتجات</h3>
+                <div class="number" id="total-products">0</div>
+            </div>
+            <div class="stat-card">
+                <h3>إجمالي الطلبات</h3>
+                <div class="number" id="total-orders">0</div>
+            </div>
+            <div class="stat-card">
+                <h3>إجمالي الإيرادات</h3>
+                <div class="number" id="total-revenue">0 ج.م</div>
+            </div>
+            <div class="stat-card">
+                <h3>منتجات قليلة المخزون</h3>
+                <div class="number" id="low-stock">0</div>
+            </div>
+        </div>
+
+        <div class="tabs">
+            <div class="tab active" onclick="switchTab('products')">المنتجات</div>
+            <div class="tab" onclick="switchTab('orders')">الطلبات</div>
+        </div>
+
+        <div class="content">
+            <button class="refresh-btn" onclick="loadData()">🔄 تحديث</button>
+            <div style="clear: both;"></div>
+
+            <div id="products-section">
+                <div class="loading">جاري تحميل المنتجات...</div>
+                <div id="products-grid" class="products-grid hidden"></div>
+            </div>
+
+            <div id="orders-section" class="hidden">
+                <div class="loading">جاري تحميل الطلبات...</div>
+                <div id="orders-table" class="hidden"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const API_URL = window.location.origin;
+        let currentTab = 'products';
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            loadData();
+            // Auto-refresh every 30 seconds
+            setInterval(loadStats, 30000);
+        });
+
+        // Switch tabs
+        function switchTab(tab) {
+            currentTab = tab;
+            
+            // Update tab styling
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            event.target.classList.add('active');
+            
+            // Show/hide sections
+            if (tab === 'products') {
+                document.getElementById('products-section').classList.remove('hidden');
+                document.getElementById('orders-section').classList.add('hidden');
+                loadProducts();
+            } else {
+                document.getElementById('products-section').classList.add('hidden');
+                document.getElementById('orders-section').classList.remove('hidden');
+                loadOrders();
+            }
+        }
+
+        // Load all data
+        async function loadData() {
+            await loadStats();
+            if (currentTab === 'products') {
+                await loadProducts();
+            } else {
+                await loadOrders();
+            }
+        }
+
+        // Load statistics
+        async function loadStats() {
+            try {
+                const response = await fetch(`${API_URL}/stats`);
+                const data = await response.json();
+                
+                document.getElementById('total-products').textContent = data.total_products;
+                document.getElementById('total-orders').textContent = data.total_orders;
+                document.getElementById('total-revenue').textContent = data.total_revenue.toFixed(2) + ' ج.م';
+                document.getElementById('low-stock').textContent = data.low_stock_products || 0;
+            } catch (error) {
+                showAlert('خطأ في تحميل الإحصائيات', 'error');
+            }
+        }
+
+        // Load products
+        async function loadProducts() {
+            try {
+                const response = await fetch(`${API_URL}/products`);
+                const products = await response.json();
+                
+                const grid = document.getElementById('products-grid');
+                const loading = document.querySelector('#products-section .loading');
+                
+                loading.classList.add('hidden');
+                grid.classList.remove('hidden');
+                
+                grid.innerHTML = products.map(product => `
+                    <div class="product-card">
+                        <div class="product-name">${product.name}</div>
+                        <div class="product-price">${product.price} ج.م</div>
+                        <div class="product-stock ${product.stock < 10 ? 'stock-low' : ''}">
+                            المخزون: ${product.stock} قطعة
+                        </div>
+                        <div class="order-form">
+                            <input 
+                                type="number" 
+                                id="qty-${product.id}" 
+                                min="1" 
+                                max="${product.stock}" 
+                                value="1"
+                                ${product.stock === 0 ? 'disabled' : ''}
+                            >
+                            <button 
+                                onclick="createOrder(${product.id})"
+                                ${product.stock === 0 ? 'disabled' : ''}
+                            >
+                                ${product.stock === 0 ? 'نفذ المخزون' : 'اطلب الآن'}
+                            </button>
+                        </div>
+                    </div>
+                `).join('');
+                
+            } catch (error) {
+                showAlert('خطأ في تحميل المنتجات', 'error');
+            }
+        }
+
+        // Load orders
+        async function loadOrders() {
+            try {
+                const response = await fetch(`${API_URL}/orders`);
+                const orders = await response.json();
+                
+                const container = document.getElementById('orders-table');
+                const loading = document.querySelector('#orders-section .loading');
+                
+                loading.classList.add('hidden');
+                container.classList.remove('hidden');
+                
+                if (orders.length === 0) {
+                    container.innerHTML = '<p style="text-align: center; padding: 40px; color: #999;">لا توجد طلبات حتى الآن</p>';
+                    return;
+                }
+                
+                container.innerHTML = `
+                    <table class="orders-table">
+                        <thead>
+                            <tr>
+                                <th>رقم الطلب</th>
+                                <th>المنتج</th>
+                                <th>الكمية</th>
+                                <th>الإجمالي</th>
+                                <th>التاريخ</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${orders.map(order => `
+                                <tr>
+                                    <td>#${order.id}</td>
+                                    <td>${order.product_name}</td>
+                                    <td>${order.quantity}</td>
+                                    <td>${order.total_price} ج.م</td>
+                                    <td>${new Date(order.order_date).toLocaleString('ar-EG')}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+                
+            } catch (error) {
+                showAlert('خطأ في تحميل الطلبات', 'error');
+            }
+        }
+
+        // Create order
+        async function createOrder(productId) {
+            const quantity = parseInt(document.getElementById(`qty-${productId}`).value);
+            
+            if (!quantity || quantity < 1) {
+                showAlert('الرجاء إدخال كمية صحيحة', 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`${API_URL}/orders`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        product_id: productId,
+                        quantity: quantity
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    showAlert(`تم إنشاء الطلب بنجاح! رقم الطلب: #${data.order_id}`, 'success');
+                    loadData(); // Refresh all data
+                } else {
+                    showAlert(data.error || 'حدث خطأ في إنشاء الطلب', 'error');
+                }
+                
+            } catch (error) {
+                showAlert('خطأ في الاتصال بالخادم', 'error');
+            }
+        }
+
+        // Show alert
+        function showAlert(message, type) {
+            const container = document.getElementById('alert-container');
+            const alert = document.createElement('div');
+            alert.className = `alert alert-${type}`;
+            alert.textContent = message;
+            
+            container.appendChild(alert);
+            
+            setTimeout(() => {
+                alert.remove();
+            }, 5000);
+        }
+
+        // Health check
+        async function checkHealth() {
+            try {
+                const response = await fetch(`${API_URL}/health`);
+                if (response.ok) {
+                    console.log('✅ Application is healthy');
+                }
+            } catch (error) {
+                console.error('❌ Application health check failed');
+            }
+        }
+
+        // Check health every minute
+        setInterval(checkHealth, 60000);
+        checkHealth();
+    </script>
+</body>
+</html>
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ecommerce-app
+  labels:
+    app: ecommerce
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ecommerce
+  template:
+    metadata:
+      labels:
+        app: ecommerce
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: ecommerce
+        image: marwanhassan22/ecommerce-app:v1
+        ports:
+        - containerPort: 5000
+          name: http
+        env:
+        - name: FLASK_ENV
+          value: "production"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        volumeMounts:
+        - name: app-data
+          mountPath: /app
+      volumes:
+      - name: app-data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ecommerce-service
+  labels:
+    app: ecommerce
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "5000"
+    prometheus.io/path: "/metrics"
+spec:
+  type: NodePort
+  selector:
+    app: ecommerce
+  ports:
+  - port: 5000
+    targetPort: 5000
+    nodePort: 30080
+    protocol: TCP
+    name: http
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ecommerce-html
+  labels:
+    app: ecommerce
+data:
+  index.html: |
+    <!-- Copy the full HTML content from index.html artifact here -->
+    <!-- Or mount it as a volume in the deployment -->
+---
+# Update deployment to include the HTML
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ecommerce-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ecommerce
+  template:
+    metadata:
+      labels:
+        app: ecommerce
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: ecommerce
+        image: marwanhassan22:latest
+        ports:
+        - containerPort: 5000
+        volumeMounts:
+        - name: html-volume
+          mountPath: /app/index.html
+          subPath: index.html
+        - name: app-data
+          mountPath: /app/data
+      volumes:
+      - name: html-volume
+        configMap:
+          name: ecommerce-html
+      - name: app-data
+        emptyDir: {}
+Flask==2.3.0
+prometheus-flask-exporter==0.22.4
+werkzeug==2.3.0
+FROM python:3.9-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application
+COPY app.py .
+
+# Create volume for database
+VOLUME ["/app"]
+
+# Expose ports
+EXPOSE 5000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:5000/health || exit 1
+
+# Run application
+CMD ["python", "app.py"]
+from flask import Flask, jsonify, request, send_from_directory
+from prometheus_flask_exporter import PrometheusMetrics
+from prometheus_client import Counter
+import sqlite3
+import logging
+from datetime import datetime
+import os
+
+app = Flask(__name__, static_folder='.')
+
+# Prometheus metrics
+metrics = PrometheusMetrics(app, defaults_prefix="ecommerce_app")
+metrics.info('app_info', 'E-commerce Application', version='1.0.0')
+
+# Custom metrics
+order_counter = Counter(
+    'ecommerce_app_orders_total', 
+    'Total number of successfully created orders'
+)
+
+order_revenue = Counter(
+    'ecommerce_app_revenue_total',
+    'Total revenue from orders'
+)
+
+product_requests = Counter(
+    'ecommerce_app_product_requests_total',
+    'Total product requests',
+    ['endpoint', 'method']
+)
+
+low_stock_products = Counter(
+    'ecommerce_app_low_stock_total',
+    'Products with low stock (< 10 items)'
+)
+
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Safe DB connection
+def get_db():
+    conn = sqlite3.connect('ecommerce.db', check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# DB Initialization
+def init_db():
+    conn = sqlite3.connect('ecommerce.db')
+    c = conn.cursor()
+
+    c.execute('''CREATE TABLE IF NOT EXISTS products
+                (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                price REAL NOT NULL,
+                stock INTEGER NOT NULL)''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS orders
+                (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER,
+                quantity INTEGER,
+                total_price REAL,
+                order_date TEXT,
+                FOREIGN KEY(product_id) REFERENCES products(id))''')
+
+    # Insert sample data
+    c.execute("SELECT COUNT(*) FROM products")
+    if c.fetchone()[0] == 0:
+        sample = [
+            ('Laptop', 15000, 50),
+            ('Phone', 8000, 100),
+            ('Headphones', 500, 200),
+            ('Mouse', 150, 300),
+            ('Keyboard', 800, 150)
+        ]
+        c.executemany("INSERT INTO products (name, price, stock) VALUES (?, ?, ?)", sample)
+
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized successfully")
+
+init_db()
+
+# Serve HTML
+@app.route('/')
+def index():
+    return send_from_directory('.', 'index.html')
+
+# API Routes
+@app.route('/health')
+def health():
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()}), 200
+
+@app.route('/products')
+def get_products():
+    try:
+        product_requests.labels(endpoint='/products', method='GET').inc()
+        
+        conn = get_db()
+        rows = conn.execute("SELECT * FROM products").fetchall()
+        conn.close()
+
+        for row in rows:
+            if row['stock'] < 10:
+                low_stock_products.inc()
+
+        return jsonify([dict(r) for r in rows]), 200
+        
+    except Exception as e:
+        logger.error(f"Error getting products: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/products/<int:pid>')
+def get_product(pid):
+    try:
+        product_requests.labels(endpoint=f'/products/{pid}', method='GET').inc()
+        
+        conn = get_db()
+        item = conn.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+        conn.close()
+
+        if item:
+            return jsonify(dict(item)), 200
+        return jsonify({"error": "Product not found"}), 404
+
+    except Exception as e:
+        logger.error(f"Error getting product: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/orders', methods=['POST'])
+def create_order():
+    try:
+        data = request.get_json()
+        pid = data.get("product_id")
+        qty = data.get("quantity")
+
+        if not pid or not qty:
+            return jsonify({"error": "product_id and quantity required"}), 400
+
+        conn = get_db()
+        product = conn.execute("SELECT * FROM products WHERE id = ?", (pid,)).fetchone()
+
+        if not product:
+            conn.close()
+            return jsonify({"error": "Product not found"}), 404
+
+        if product["stock"] < qty:
+            conn.close()
+            return jsonify({"error": "Insufficient stock"}), 400
+
+        total = product["price"] * qty
+        date = datetime.now().isoformat()
+
+        cur = conn.cursor()
+        cur.execute("INSERT INTO orders (product_id, quantity, total_price, order_date) VALUES (?, ?, ?, ?)",
+                    (pid, qty, total, date))
+        cur.execute("UPDATE products SET stock = stock - ? WHERE id = ?", (qty, pid))
+
+        order_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+
+        order_counter.inc()
+        order_revenue.inc(total)
+
+        logger.info(f"Order {order_id} created - Revenue: {total}")
+        
+        return jsonify({
+            "order_id": order_id,
+            "product_id": pid,
+            "quantity": qty,
+            "total_price": total,
+            "order_date": date
+        }), 201
+
+    except Exception as e:
+        logger.error(f"Error creating order: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/orders')
+def get_orders():
+    try:
+        conn = get_db()
+        rows = conn.execute("""
+            SELECT o.*, p.name AS product_name
+            FROM orders o JOIN products p ON o.product_id = p.id
+            ORDER BY o.order_date DESC
+        """).fetchall()
+        conn.close()
+
+        return jsonify([dict(r) for r in rows]), 200
+
+    except Exception as e:
+        logger.error(f"Error getting orders: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/stats')
+def stats():
+    try:
+        conn = get_db()
+        products = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        revenue = conn.execute("SELECT SUM(total_price) FROM orders").fetchone()[0] or 0
+        low_stock = conn.execute("SELECT COUNT(*) FROM products WHERE stock < 10").fetchone()[0]
+        conn.close()
+
+        return jsonify({
+            "total_products": products,
+            "total_orders": orders,
+            "total_revenue": revenue,
+            "low_stock_products": low_stock
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error getting stats: {e}")
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ecommerce-alerts
+  labels:
+    app: ecommerce
+    release: prometheus
+spec:
+  groups:
+  - name: ecommerce
+    interval: 30s
+    rules:
+    # Application availability
+    - alert: EcommerceAppDown
+      expr: up{job="ecommerce-service"} == 0
+      for: 1m
+      labels:
+        severity: critical
+        app: ecommerce
+      annotations:
+        summary: "E-commerce application is down"
+        description: "E-commerce app {{ $labels.instance }} has been down for more than 1 minute"
+    
+    # High error rate
+    - alert: HighErrorRate
+      expr: rate(flask_http_request_total{status=~"5.."}[5m]) > 0.05
+      for: 2m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "High error rate detected"
+        description: "Error rate is {{ $value }} errors per second on {{ $labels.instance }}"
+    
+    # High response time
+    - alert: HighResponseTime
+      expr: flask_http_request_duration_seconds_sum / flask_http_request_duration_seconds_count > 1
+      for: 3m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "High response time detected"
+        description: "Average response time is {{ $value }}s on {{ $labels.instance }}"
+    
+    # High memory usage
+    - alert: HighMemoryUsage
+      expr: container_memory_usage_bytes{pod=~"ecommerce-app-.*"} / container_spec_memory_limit_bytes{pod=~"ecommerce-app-.*"} > 0.85
+      for: 5m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "High memory usage"
+        description: "Memory usage is {{ $value | humanizePercentage }} on pod {{ $labels.pod }}"
+    
+    # High CPU usage
+    - alert: HighCPUUsage
+      expr: rate(container_cpu_usage_seconds_total{pod=~"ecommerce-app-.*"}[5m]) > 0.8
+      for: 5m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "High CPU usage"
+        description: "CPU usage is {{ $value | humanizePercentage }} on pod {{ $labels.pod }}"
+    
+    # Pod restart
+    - alert: PodRestarting
+      expr: rate(kube_pod_container_status_restarts_total{pod=~"ecommerce-app-.*"}[15m]) > 0
+      for: 5m
+      labels:
+        severity: warning
+        app: ecommerce
+      annotations:
+        summary: "Pod is restarting frequently"
+        description: "Pod {{ $labels.pod }} has restarted {{ $value }} times in the last 15 minutes"
+    
+    # Low request rate (potential issue)
+    - alert: LowRequestRate
+      expr: rate(flask_http_request_total[5m]) < 0.01
+      for: 10m
+      labels:
+        severity: info
+        app: ecommerce
+      annotations:
+        summary: "Low request rate detected"
+        description: "Request rate is very low: {{ $value }} requests/sec on {{ $labels.instance }}"
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: ecommerce-monitor
+  labels:
+    app: ecommerce
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: ecommerce
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 15s
+    scrapeTimeout: 10s
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>متجر إلكتروني - E-commerce Store</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        header {
+            background: white;
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin-bottom: 30px;
+            text-align: center;
+        }
+
+        h1 {
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+
+        .stat-card h3 {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 10px;
+        }
+
+        .stat-card .number {
+            font-size: 28px;
+            font-weight: bold;
+            color: #667eea;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .tab {
+            background: white;
+            padding: 12px 25px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+            box-shadow: 0 3px 10px rgba(0,0,0,0.1);
+        }
+
+        .tab:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+
+        .tab.active {
+            background: #667eea;
+            color: white;
+        }
+
+        .content {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+
+        .products-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 20px;
+        }
+
+        .product-card {
+            background: linear-gradient(145deg, #f0f0f0, #ffffff);
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            transition: transform 0.3s;
+        }
+
+        .product-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+        }
+
+        .product-name {
+            font-size: 20px;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 10px;
+        }
+
+        .product-price {
+            font-size: 24px;
+            color: #667eea;
+            margin: 10px 0;
+        }
+
+        .product-stock {
+            color: #666;
+            margin-bottom: 15px;
+        }
+
+        .stock-low {
+            color: #e74c3c;
+            font-weight: bold;
+        }
+
+        .order-form {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+
+        input[type="number"] {
+            flex: 1;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 5px;
+            font-size: 16px;
+        }
+
+        button {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: all 0.3s;
+        }
+
+        button:hover {
+            background: #5568d3;
+            transform: scale(1.05);
+        }
+
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .orders-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .orders-table th,
+        .orders-table td {
+            padding: 12px;
+            text-align: right;
+            border-bottom: 1px solid #ddd;
+        }
+
+        .orders-table th {
+            background: #667eea;
+            color: white;
+            font-weight: bold;
+        }
+
+        .orders-table tr:hover {
+            background: #f5f5f5;
+        }
+
+        .alert {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            animation: slideIn 0.3s;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateY(-20px);
+                opacity: 0;
+            }
+            to {
+                transform: translateY(0);
+                opacity: 1;
+            }
+        }
+
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .alert-error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #667eea;
+            font-size: 18px;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .refresh-btn {
+            background: #28a745;
+            float: left;
+            margin-bottom: 20px;
+        }
+
+        .refresh-btn:hover {
+            background: #218838;
+        }
+
+        @media (max-width: 768px) {
+            .stats {
+                grid-template-columns: 1fr;
+            }
+            
+            .products-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .tabs {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🛒 المتجر الإلكتروني</h1>
+            <p>E-commerce Store with Real-time Monitoring</p>
+        </header>
+
+        <div id="alert-container"></div>
+
+        <div class="stats">
+            <div class="stat-card">
+                <h3>إجمالي المنتجات</h3>
+                <div class="number" id="total-products">0</div>
+            </div>
+            <div class="stat-card">
+                <h3>إجمالي الطلبات</h3>
+                <div class="number" id="total-orders">0</div>
+            </div>
+            <div class="stat-card">
+                <h3>إجمالي الإيرادات</h3>
+                <div class="number" id="total-revenue">0 ج.م</div>
+            </div>
+            <div class="stat-card">
+                <h3>منتجات قليلة المخزون</h3>
+                <div class="number" id="low-stock">0</div>
+            </div>
+        </div>
+
+        <div class="tabs">
+            <div class="tab active" onclick="switchTab('products')">المنتجات</div>
+            <div class="tab" onclick="switchTab('orders')">الطلبات</div>
+        </div>
+
+        <div class="content">
+            <button class="refresh-btn" onclick="loadData()">🔄 تحديث</button>
+            <div style="clear: both;"></div>
+
+            <div id="products-section">
+                <div class="loading">جاري تحميل المنتجات...</div>
+                <div id="products-grid" class="products-grid hidden"></div>
+            </div>
+
+            <div id="orders-section" class="hidden">
+                <div class="loading">جاري تحميل الطلبات...</div>
+                <div id="orders-table" class="hidden"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const API_URL = window.location.origin;
+        let currentTab = 'products';
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            loadData();
+            // Auto-refresh every 30 seconds
+            setInterval(loadStats, 30000);
+        });
+
+        // Switch tabs
+        function switchTab(tab) {
+            currentTab = tab;
+            
+            // Update tab styling
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            event.target.classList.add('active');
+            
+            // Show/hide sections
+            if (tab === 'products') {
+                document.getElementById('products-section').classList.remove('hidden');
+                document.getElementById('orders-section').classList.add('hidden');
+                loadProducts();
+            } else {
+                document.getElementById('products-section').classList.add('hidden');
+                document.getElementById('orders-section').classList.remove('hidden');
+                loadOrders();
+            }
+        }
+
+        // Load all data
+        async function loadData() {
+            await loadStats();
+            if (currentTab === 'products') {
+                await loadProducts();
+            } else {
+                await loadOrders();
+            }
+        }
+
+        // Load statistics
+        async function loadStats() {
+            try {
+                const response = await fetch(`${API_URL}/stats`);
+                const data = await response.json();
+                
+                document.getElementById('total-products').textContent = data.total_products;
+                document.getElementById('total-orders').textContent = data.total_orders;
+                document.getElementById('total-revenue').textContent = data.total_revenue.toFixed(2) + ' ج.م';
+                document.getElementById('low-stock').textContent = data.low_stock_products || 0;
+            } catch (error) {
+                showAlert('خطأ في تحميل الإحصائيات', 'error');
+            }
+        }
+
+        // Load products
+        async function loadProducts() {
+            try {
+                const response = await fetch(`${API_URL}/products`);
+                const products = await response.json();
+                
+                const grid = document.getElementById('products-grid');
+                const loading = document.querySelector('#products-section .loading');
+                
+                loading.classList.add('hidden');
+                grid.classList.remove('hidden');
+                
+                grid.innerHTML = products.map(product => `
+                    <div class="product-card">
+                        <div class="product-name">${product.name}</div>
+                        <div class="product-price">${product.price} ج.م</div>
+                        <div class="product-stock ${product.stock < 10 ? 'stock-low' : ''}">
+                            المخزون: ${product.stock} قطعة
+                        </div>
+                        <div class="order-form">
+                            <input 
+                                type="number" 
+                                id="qty-${product.id}" 
+                                min="1" 
+                                max="${product.stock}" 
+                                value="1"
+                                ${product.stock === 0 ? 'disabled' : ''}
+                            >
+                            <button 
+                                onclick="createOrder(${product.id})"
+                                ${product.stock === 0 ? 'disabled' : ''}
+                            >
+                                ${product.stock === 0 ? 'نفذ المخزون' : 'اطلب الآن'}
+                            </button>
+                        </div>
+                    </div>
+                `).join('');
+                
+            } catch (error) {
+                showAlert('خطأ في تحميل المنتجات', 'error');
+            }
+        }
+
+        // Load orders
+        async function loadOrders() {
+            try {
+                const response = await fetch(`${API_URL}/orders`);
+                const orders = await response.json();
+                
+                const container = document.getElementById('orders-table');
+                const loading = document.querySelector('#orders-section .loading');
+                
+                loading.classList.add('hidden');
+                container.classList.remove('hidden');
+                
+                if (orders.length === 0) {
+                    container.innerHTML = '<p style="text-align: center; padding: 40px; color: #999;">لا توجد طلبات حتى الآن</p>';
+                    return;
+                }
+                
+                container.innerHTML = `
+                    <table class="orders-table">
+                        <thead>
+                            <tr>
+                                <th>رقم الطلب</th>
+                                <th>المنتج</th>
+                                <th>الكمية</th>
+                                <th>الإجمالي</th>
+                                <th>التاريخ</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${orders.map(order => `
+                                <tr>
+                                    <td>#${order.id}</td>
+                                    <td>${order.product_name}</td>
+                                    <td>${order.quantity}</td>
+                                    <td>${order.total_price} ج.م</td>
+                                    <td>${new Date(order.order_date).toLocaleString('ar-EG')}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+                
+            } catch (error) {
+                showAlert('خطأ في تحميل الطلبات', 'error');
+            }
+        }
+
+        // Create order
+        async function createOrder(productId) {
+            const quantity = parseInt(document.getElementById(`qty-${productId}`).value);
+            
+            if (!quantity || quantity < 1) {
+                showAlert('الرجاء إدخال كمية صحيحة', 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`${API_URL}/orders`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        product_id: productId,
+                        quantity: quantity
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    showAlert(`تم إنشاء الطلب بنجاح! رقم الطلب: #${data.order_id}`, 'success');
+                    loadData(); // Refresh all data
+                } else {
+                    showAlert(data.error || 'حدث خطأ في إنشاء الطلب', 'error');
+                }
+                
+            } catch (error) {
+                showAlert('خطأ في الاتصال بالخادم', 'error');
+            }
+        }
+
+        // Show alert
+        function showAlert(message, type) {
+            const container = document.getElementById('alert-container');
+            const alert = document.createElement('div');
+            alert.className = `alert alert-${type}`;
+            alert.textContent = message;
+            
+            container.appendChild(alert);
+            
+            setTimeout(() => {
+                alert.remove();
+            }, 5000);
+        }
+
+        // Health check
+        async function checkHealth() {
+            try {
+                const response = await fetch(`${API_URL}/health`);
+                if (response.ok) {
+                    console.log('✅ Application is healthy');
+                }
+            } catch (error) {
+                console.error('❌ Application health check failed');
+            }
+        }
+
+        // Check health every minute
+        setInterval(checkHealth, 60000);
+        checkHealth();
+    </script>
+</body>
+</html>
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ecommerce-app
+  labels:
+    app: ecommerce
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ecommerce
+  template:
+    metadata:
+      labels:
+        app: ecommerce
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: ecommerce
+        image: marwanhassan22/ecommerce-app:v1
+        ports:
+        - containerPort: 5000
+          name: http
+        env:
+        - name: FLASK_ENV
+          value: "production"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        volumeMounts:
+        - name: app-data
+          mountPath: /app
+      volumes:
+      - name: app-data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ecommerce-service
+  labels:
+    app: ecommerce
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "5000"
+    prometheus.io/path: "/metrics"
+spec:
+  type: NodePort
+  selector:
+    app: ecommerce
+  ports:
+  - port: 5000
+    targetPort: 5000
+    nodePort: 30080
+    protocol: TCP
+    name: http
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ecommerce-html
+  labels:
+    app: ecommerce
+data:
+  index.html: |
+    <!-- Copy the full HTML content from index.html artifact here -->
+    <!-- Or mount it as a volume in the deployment -->
+---
+# Update deployment to include the HTML
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ecommerce-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ecommerce
+  template:
+    metadata:
+      labels:
+        app: ecommerce
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: ecommerce
+        image: marwanhassan22:latest
+        ports:
+        - containerPort: 5000
+        volumeMounts:
+        - name: html-volume
+          mountPath: /app/index.html
+          subPath: index.html
+        - name: app-data
+          mountPath: /app/data
+      volumes:
+      - name: html-volume
+        configMap:
+          name: ecommerce-html
+      - name: app-data
+        emptyDir: {}
+Flask==2.3.0
+prometheus-flask-exporter==0.22.4
+werkzeug==2.3.0

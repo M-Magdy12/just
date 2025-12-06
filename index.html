@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>متجر إلكتروني - E-commerce Store</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        header {
+            background: white;
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin-bottom: 30px;
+            text-align: center;
+        }
+
+        h1 {
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+
+        .stat-card h3 {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 10px;
+        }
+
+        .stat-card .number {
+            font-size: 28px;
+            font-weight: bold;
+            color: #667eea;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .tab {
+            background: white;
+            padding: 12px 25px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+            box-shadow: 0 3px 10px rgba(0,0,0,0.1);
+        }
+
+        .tab:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+
+        .tab.active {
+            background: #667eea;
+            color: white;
+        }
+
+        .content {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+
+        .products-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 20px;
+        }
+
+        .product-card {
+            background: linear-gradient(145deg, #f0f0f0, #ffffff);
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            transition: transform 0.3s;
+        }
+
+        .product-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+        }
+
+        .product-name {
+            font-size: 20px;
+            font-weight: bold;
+            color: #333;
+            margin-bottom: 10px;
+        }
+
+        .product-price {
+            font-size: 24px;
+            color: #667eea;
+            margin: 10px 0;
+        }
+
+        .product-stock {
+            color: #666;
+            margin-bottom: 15px;
+        }
+
+        .stock-low {
+            color: #e74c3c;
+            font-weight: bold;
+        }
+
+        .order-form {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+
+        input[type="number"] {
+            flex: 1;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 5px;
+            font-size: 16px;
+        }
+
+        button {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: all 0.3s;
+        }
+
+        button:hover {
+            background: #5568d3;
+            transform: scale(1.05);
+        }
+
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .orders-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .orders-table th,
+        .orders-table td {
+            padding: 12px;
+            text-align: right;
+            border-bottom: 1px solid #ddd;
+        }
+
+        .orders-table th {
+            background: #667eea;
+            color: white;
+            font-weight: bold;
+        }
+
+        .orders-table tr:hover {
+            background: #f5f5f5;
+        }
+
+        .alert {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            animation: slideIn 0.3s;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateY(-20px);
+                opacity: 0;
+            }
+            to {
+                transform: translateY(0);
+                opacity: 1;
+            }
+        }
+
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .alert-error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #667eea;
+            font-size: 18px;
+        }
+
+        .hidden {
+            display: none;
+        }
+
+        .refresh-btn {
+            background: #28a745;
+            float: left;
+            margin-bottom: 20px;
+        }
+
+        .refresh-btn:hover {
+            background: #218838;
+        }
+
+        @media (max-width: 768px) {
+            .stats {
+                grid-template-columns: 1fr;
+            }
+            
+            .products-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .tabs {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🛒 المتجر الإلكتروني</h1>
+            <p>E-commerce Store with Real-time Monitoring</p>
+        </header>
+
+        <div id="alert-container"></div>
+
+        <div class="stats">
+            <div class="stat-card">
+                <h3>إجمالي المنتجات</h3>
+                <div class="number" id="total-products">0</div>
+            </div>
+            <div class="stat-card">
+                <h3>إجمالي الطلبات</h3>
+                <div class="number" id="total-orders">0</div>
+            </div>
+            <div class="stat-card">
+                <h3>إجمالي الإيرادات</h3>
+                <div class="number" id="total-revenue">0 ج.م</div>
+            </div>
+            <div class="stat-card">
+                <h3>منتجات قليلة المخزون</h3>
+                <div class="number" id="low-stock">0</div>
+            </div>
+        </div>
+
+        <div class="tabs">
+            <div class="tab active" onclick="switchTab('products')">المنتجات</div>
+            <div class="tab" onclick="switchTab('orders')">الطلبات</div>
+        </div>
+
+        <div class="content">
+            <button class="refresh-btn" onclick="loadData()">🔄 تحديث</button>
+            <div style="clear: both;"></div>
+
+            <div id="products-section">
+                <div class="loading">جاري تحميل المنتجات...</div>
+                <div id="products-grid" class="products-grid hidden"></div>
+            </div>
+
+            <div id="orders-section" class="hidden">
+                <div class="loading">جاري تحميل الطلبات...</div>
+                <div id="orders-table" class="hidden"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const API_URL = window.location.origin;
+        let currentTab = 'products';
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            loadData();
+            // Auto-refresh every 30 seconds
+            setInterval(loadStats, 30000);
+        });
+
+        // Switch tabs
+        function switchTab(tab) {
+            currentTab = tab;
+            
+            // Update tab styling
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            event.target.classList.add('active');
+            
+            // Show/hide sections
+            if (tab === 'products') {
+                document.getElementById('products-section').classList.remove('hidden');
+                document.getElementById('orders-section').classList.add('hidden');
+                loadProducts();
+            } else {
+                document.getElementById('products-section').classList.add('hidden');
+                document.getElementById('orders-section').classList.remove('hidden');
+                loadOrders();
+            }
+        }
+
+        // Load all data
+        async function loadData() {
+            await loadStats();
+            if (currentTab === 'products') {
+                await loadProducts();
+            } else {
+                await loadOrders();
+            }
+        }
+
+        // Load statistics
+        async function loadStats() {
+            try {
+                const response = await fetch(`${API_URL}/stats`);
+                const data = await response.json();
+                
+                document.getElementById('total-products').textContent = data.total_products;
+                document.getElementById('total-orders').textContent = data.total_orders;
+                document.getElementById('total-revenue').textContent = data.total_revenue.toFixed(2) + ' ج.م';
+                document.getElementById('low-stock').textContent = data.low_stock_products || 0;
+            } catch (error) {
+                showAlert('خطأ في تحميل الإحصائيات', 'error');
+            }
+        }
+
+        // Load products
+        async function loadProducts() {
+            try {
+                const response = await fetch(`${API_URL}/products`);
+                const products = await response.json();
+                
+                const grid = document.getElementById('products-grid');
+                const loading = document.querySelector('#products-section .loading');
+                
+                loading.classList.add('hidden');
+                grid.classList.remove('hidden');
+                
+                grid.innerHTML = products.map(product => `
+                    <div class="product-card">
+                        <div class="product-name">${product.name}</div>
+                        <div class="product-price">${product.price} ج.م</div>
+                        <div class="product-stock ${product.stock < 10 ? 'stock-low' : ''}">
+                            المخزون: ${product.stock} قطعة
+                        </div>
+                        <div class="order-form">
+                            <input 
+                                type="number" 
+                                id="qty-${product.id}" 
+                                min="1" 
+                                max="${product.stock}" 
+                                value="1"
+                                ${product.stock === 0 ? 'disabled' : ''}
+                            >
+                            <button 
+                                onclick="createOrder(${product.id})"
+                                ${product.stock === 0 ? 'disabled' : ''}
+                            >
+                                ${product.stock === 0 ? 'نفذ المخزون' : 'اطلب الآن'}
+                            </button>
+                        </div>
+                    </div>
+                `).join('');
+                
+            } catch (error) {
+                showAlert('خطأ في تحميل المنتجات', 'error');
+            }
+        }
+
+        // Load orders
+        async function loadOrders() {
+            try {
+                const response = await fetch(`${API_URL}/orders`);
+                const orders = await response.json();
+                
+                const container = document.getElementById('orders-table');
+                const loading = document.querySelector('#orders-section .loading');
+                
+                loading.classList.add('hidden');
+                container.classList.remove('hidden');
+                
+                if (orders.length === 0) {
+                    container.innerHTML = '<p style="text-align: center; padding: 40px; color: #999;">لا توجد طلبات حتى الآن</p>';
+                    return;
+                }
+                
+                container.innerHTML = `
+                    <table class="orders-table">
+                        <thead>
+                            <tr>
+                                <th>رقم الطلب</th>
+                                <th>المنتج</th>
+                                <th>الكمية</th>
+                                <th>الإجمالي</th>
+                                <th>التاريخ</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${orders.map(order => `
+                                <tr>
+                                    <td>#${order.id}</td>
+                                    <td>${order.product_name}</td>
+                                    <td>${order.quantity}</td>
+                                    <td>${order.total_price} ج.م</td>
+                                    <td>${new Date(order.order_date).toLocaleString('ar-EG')}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+                
+            } catch (error) {
+                showAlert('خطأ في تحميل الطلبات', 'error');
+            }
+        }
+
+        // Create order
+        async function createOrder(productId) {
+            const quantity = parseInt(document.getElementById(`qty-${productId}`).value);
+            
+            if (!quantity || quantity < 1) {
+                showAlert('الرجاء إدخال كمية صحيحة', 'error');
+                return;
+            }
+            
+            try {
+                const response = await fetch(`${API_URL}/orders`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        product_id: productId,
+                        quantity: quantity
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    showAlert(`تم إنشاء الطلب بنجاح! رقم الطلب: #${data.order_id}`, 'success');
+                    loadData(); // Refresh all data
+                } else {
+                    showAlert(data.error || 'حدث خطأ في إنشاء الطلب', 'error');
+                }
+                
+            } catch (error) {
+                showAlert('خطأ في الاتصال بالخادم', 'error');
+            }
+        }
+
+        // Show alert
+        function showAlert(message, type) {
+            const container = document.getElementById('alert-container');
+            const alert = document.createElement('div');
+            alert.className = `alert alert-${type}`;
+            alert.textContent = message;
+            
+            container.appendChild(alert);
+            
+            setTimeout(() => {
+                alert.remove();
+            }, 5000);
+        }
+
+        // Health check
+        async function checkHealth() {
+            try {
+                const response = await fetch(`${API_URL}/health`);
+                if (response.ok) {
+                    console.log('✅ Application is healthy');
+                }
+            } catch (error) {
+                console.error('❌ Application health check failed');
+            }
+        }
+
+        // Check health every minute
+        setInterval(checkHealth, 60000);
+        checkHealth();
+    </script>
+</body>
+</html>

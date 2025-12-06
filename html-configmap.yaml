@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ecommerce-html
+  labels:
+    app: ecommerce
+data:
+  index.html: |
+    <!-- Copy the full HTML content from index.html artifact here -->
+    <!-- Or mount it as a volume in the deployment -->
+---
+# Update deployment to include the HTML
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ecommerce-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ecommerce
+  template:
+    metadata:
+      labels:
+        app: ecommerce
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: ecommerce
+        image: marwanhassan22:latest
+        ports:
+        - containerPort: 5000
+        volumeMounts:
+        - name: html-volume
+          mountPath: /app/index.html
+          subPath: index.html
+        - name: app-data
+          mountPath: /app/data
+      volumes:
+      - name: html-volume
+        configMap:
+          name: ecommerce-html
+      - name: app-data
+        emptyDir: {}
