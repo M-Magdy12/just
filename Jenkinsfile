@@ -16,7 +16,7 @@ pipeline {
                     sh """
                         echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
                         docker tag nginximage $DOCKER_USER/nginximage:latest
-                        docker push $DOCKER_USER/nginximage:latest
+                        docker push $DOCKER_USER/fortestinggg:latest
                     """
                 }
             }
