@@ -15,7 +15,7 @@ pipeline {
                 withCredentials([usernamePassword(credentialsId: 'dokcerhup', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
                     sh """
                         echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
-                        docker tag nginximage $DOCKER_USER/fortestinggg:latest
+                        docker tag fortestinggg $DOCKER_USER/fortestinggg:latest
                         docker push $DOCKER_USER/fortestinggg:latest
                     """
                 }
