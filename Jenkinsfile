@@ -2,7 +2,7 @@ pipeline {
     agent any
     
     environment {
-        DOCKER_USERNAME = "marwanhassan22"
+        DOCKER_USERNAME = "mmagdy12"
         APP_NAME = "ecommerce-app"
         // Dynamic version using build number and git commit
         VERSION = "${BUILD_NUMBER}-${GIT_COMMIT?.take(7) ?: 'latest'}"
@@ -64,7 +64,7 @@ pipeline {
                     echo "Step 3: Updating deployment configuration..."
                     sh """
                         # Update the image tag in the deployment file
-                        sed -i 's|image: marwanhassan22/ecommerce-app:.*|image: ${IMAGE_TAG}|g' ecommerce-deployment.yaml
+                        sed -i 's|image: mmagdy12/ecommerce-app:.*|image: ${IMAGE_TAG}|g' ecommerce-deployment.yaml
                         
                         # Verify the change
                         echo "Updated deployment file:"
