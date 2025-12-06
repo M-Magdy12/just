@@ -5,7 +5,7 @@ pipeline {
         stage('build') {
             steps {
                 sh """
-                    docker build -t nginximage .
+                    docker build -t fortestinggg .
                 """
             }
         }
