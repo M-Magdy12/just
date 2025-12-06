@@ -1,32 +1,25 @@
-# Multi-stage build for smaller image size
-FROM python:3.9-slim AS builder
-
-# Set working directory
+المرحلة الأولى: Build stage,
+FROM python:3.9-slim as builder
 WORKDIR /app
-
-# Copy requirements first (for better caching)
 COPY requirements.txt .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir --user -r requirements.txt
 
-# Final stage
+المرحلة الثانية: Runtime stage,
 FROM python:3.9-slim
-
-# Set working directory
 WORKDIR /app
 
-# Copy Python dependencies from builder
+
+
+نسخ الـ Python packages من الـ builder stage,
 COPY --from=builder /root/.local /root/.local
 
-# Copy application code
-COPY . .
+نسخ ملفات التطبيق,
+COPY app.py .
+COPY index.html .
 
-# Make sure scripts in .local are usable
+التأكد من أن الـ Python packages في الـ PATH,
 ENV PATH=/root/.local/bin:$PATH
 
-# Expose port
 EXPOSE 5000
 
-# Run the application
 CMD ["python", "app.py"]
