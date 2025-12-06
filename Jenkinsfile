@@ -41,7 +41,7 @@ pipeline {
                 script {
                     echo "Step 2: Pushing image to Docker Hub..."
                     withCredentials([usernamePassword(
-                        credentialsId: "${DOCKER_CREDENTIALS_ID}",
+                        credentialsId: "${docker}",
                         usernameVariable: 'DOCKER_USER',
                         passwordVariable: 'DOCKER_PASS'
                     )]) {
