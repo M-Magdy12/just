@@ -1,29 +1,32 @@
-# المرحلة الأولى: Build stage
-FROM python:3.9-slim as builder
+# Multi-stage build for smaller image size
+FROM python:3.9-slim AS builder
+
+# Set working directory
 WORKDIR /app
+
+# Copy requirements first (for better caching)
 COPY requirements.txt .
+
+# Install Python dependencies
 RUN pip install --no-cache-dir --user -r requirements.txt
 
-# المرحلة الثانية: Runtime stage
+# Final stage
 FROM python:3.9-slim
+
+# Set working directory
 WORKDIR /app
 
-# تثبيت curl فقط للـ healthcheck
-RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
-
-# نسخ الـ Python packages من الـ builder stage
+# Copy Python dependencies from builder
 COPY --from=builder /root/.local /root/.local
 
-# نسخ ملفات التطبيق
-COPY app.py .
-COPY index.html .
+# Copy application code
+COPY . .
 
-# التأكد من أن الـ Python packages في الـ PATH
+# Make sure scripts in .local are usable
 ENV PATH=/root/.local/bin:$PATH
 
+# Expose port
 EXPOSE 5000
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:5000/health || exit 1
-
+# Run the application
 CMD ["python", "app.py"]
