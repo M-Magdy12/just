@@ -48,9 +48,9 @@ pipeline {
 
     stage('kubectl apply manifests') {
       steps {
-        withCredentials([file(credentialsId: 'kubeconfig-file', variable: 'SECRET-TEXT')]) {
+        withCredentials([file(credentialsId: 'kubeconfig-filee', variable: 'SECRET-FILE')]) {
           sh '''
-            export KUBECONFIG="${SECRET-TEXT}"
+            export KUBECONFIG="${SECRET-FILE}"
             kubectl apply -f ${DEPLOYMENT_YAML}
             kubectl apply -f ecommerce-servicemonitor.yaml  true
             kubectl apply -f ecommerce-alert-rules.yaml  true
@@ -61,9 +61,9 @@ pipeline {
 
     stage('Wait for pods ready') {
       steps {
-        withCredentials([file(credentialsId: 'kubeconfig-file', variable: 'SECRET-TEXT')]) {
+        withCredentials([file(credentialsId: 'kubeconfig-filee', variable: 'SECRET-FILE')]) {
           sh '''
-            export KUBECONFIG="${SECRET-TEXT}"
+            export KUBECONFIG="${SECRET-FILE}"
             kubectl wait --for=condition=ready pod -l app=${APP_NAME} --timeout=180s
           '''
         }
@@ -72,9 +72,9 @@ pipeline {
 
     stage('Service Info') {
       steps {
-        withCredentials([file(credentialsId: 'kubeconfig-file', variable: 'SECRET-TEXT')]) {
+        withCredentials([file(credentialsId: 'kubeconfig-filee', variable: 'SECRET-FILE')]) {
           script {
-            env.KUBECONFIG = "${SECRET-TEXT}"
+            env.KUBECONFIG = "${SECRET-FILE}"
 
             NODE_PORT = sh(script: "kubectl get svc ecommerce-service -o jsonpath='{.spec.ports[0].nodePort}'", returnStdout: true).trim()
           }  
