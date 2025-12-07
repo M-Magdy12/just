@@ -77,3 +77,9 @@ pipeline {
             env.KUBECONFIG = "${KUBECONFIG_FILE}"
 
             NODE_PORT = sh(script: "kubectl get svc ecommerce-service -o jsonpath='{.spec.ports[0].nodePort}'", returnStdout: true).trim()
+          }  
+        }
+      } 
+    }
+  }
+}
